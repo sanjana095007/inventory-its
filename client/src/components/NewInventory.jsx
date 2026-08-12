@@ -445,7 +445,8 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
       // Use the ID returned by backend; fall back to frontend-generated
       const newItem = {
         ...form,
-        id: created?.id || created?.asset_tag || form.id || `INV-${Date.now()}`,
+        dbId: created?.id,  // real DB UUID — used for PUT/DELETE API calls
+        id: created?.asset_tag || form.id || created?.id || `INV-${Date.now()}`,
         barcode: created?.barcode || payload.barcode,
         sourceId: created?.source_id || payload.source_id,
       }
@@ -513,12 +514,14 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
 
       Object.keys(assetPayload).forEach(k => assetPayload[k] === undefined && delete assetPayload[k])
 
-      await apiFetch(`/api/assets/${showEdit.id}`, {
+      // Use the real DB UUID for the API call, not the display ID
+      const assetDbId = showEdit.dbId || showEdit.id
+      await apiFetch(`/api/assets/${assetDbId}`, {
         method: 'PATCH',
         body: JSON.stringify(assetPayload),
       })
 
-      setInventory(inv => inv.map(i => i.id === showEdit.id ? { ...form } : i))
+      setInventory(inv => inv.map(i => i.id === showEdit.id ? { ...form, dbId: showEdit.dbId } : i))
       setAuditLog(al => [...al, generateAuditEntry(currentUser?.name || 'User', 'Inventory Updated', form.id, '–', form.status)])
       setShowEdit(null)
     } catch (err) {
@@ -528,12 +531,14 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
     }
   }
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (item) => {
     if (!confirm('Delete this inventory item?')) return
     try {
-      await apiFetch(`/api/assets/${id}`, { method: 'DELETE' })
-      setInventory(inv => inv.filter(i => i.id !== id))
-      setAuditLog(al => [...al, generateAuditEntry(currentUser?.name || 'User', 'Inventory Deleted', id, '–', 'Deleted')])
+      // Use real DB UUID for API, display id for local state filter
+      const assetDbId = item.dbId || item.id
+      await apiFetch(`/api/assets/${assetDbId}`, { method: 'DELETE' })
+      setInventory(inv => inv.filter(i => i.id !== item.id))
+      setAuditLog(al => [...al, generateAuditEntry(currentUser?.name || 'User', 'Inventory Deleted', item.id, '–', 'Deleted')])
     } catch (err) {
       alert(`Delete failed: ${err.message}`)
     }
@@ -633,7 +638,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
                         <button title="Edit" onClick={() => { setForm({ ...item, assignedToId: item.assigned_to || item.assignedToId || '', assigned_to: item.assigned_to || item.engineer || '' }); setShowEdit(item) }} style={{ background: '#f3f4f6', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="edit" size={13} color="#374151" /></button>
                         {item.status === 'Available' && <button title="Allocate" onClick={() => { setShowAllocate(item); setAllocForm({ engineer: '', project: '', allocationDate: new Date().toISOString().slice(0, 10), expectedReturn: '' }) }} style={{ background: '#dbeafe', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="allocate" size={13} color="#2563eb" /></button>}
                         {item.status === 'Allocated' && <button title="Return" onClick={() => { setShowReturn(item); setRetForm({ condition: 'Good' }) }} style={{ background: '#dcfce7', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="return" size={13} color="#16a34a" /></button>}
-                        {role === 'Administrator' && <button title="Delete" onClick={() => handleDelete(item.id)} style={{ background: '#fee2e2', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="trash" size={13} color="#dc2626" /></button>}
+                        {role === 'Administrator' && <button title="Delete" onClick={() => handleDelete(item)} style={{ background: '#fee2e2', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="trash" size={13} color="#dc2626" /></button>}
                       </>
                     )}
                   </div>
@@ -2146,6 +2151,57 @@ export default function InventoryApp() {
       })
       .catch(() => setCatError('Could not load categories — using defaults.'))
       .finally(() => setCatLoading(false))
+
+    // ── Fetch real inventory from backend so all items have DB UUIDs ──────────
+    apiFetch('/api/assets')
+      .then(data => {
+        console.log('[Assets API response]', data)
+        const list = Array.isArray(data)
+          ? data
+          : (data.assets || data.data || data.results || data.items || [])
+        if (list.length > 0) {
+          const mapped = list.map(a => ({
+            // DB UUID stored as dbId — used for PUT/DELETE
+            dbId:               a.id,
+            // Display fields
+            id:                 a.asset_tag || a.id,
+            name:               a.name || '',
+            type:               a.brand || '',
+            assetModel:         a.model || '',
+            category:           a.category_name || '',
+            category_id:        a.category_id || '',
+            serial:             a.serial_number || '',
+            asset_tag:          a.asset_tag || '',
+            barcode:            a.barcode || '',
+            region:             a.location_label || '',
+            location_id:        a.location_id || '',
+            status:             a.status ? a.status.charAt(0).toUpperCase() + a.status.slice(1) : 'Available',
+            remarks:            a.notes || '',
+            engineer:           a.assignee_name || '',
+            assignedToId:       a.assigned_to || '',
+            assigned_to:        a.assigned_to || '',
+            assigned_since:     a.assigned_since || '',
+            purchaseDate:       a.purchase_date || '',
+            purchasePrice:      a.purchase_price || '',
+            invoiceNumber:      a.invoice_number || '',
+            warrantyExpiry:     a.warranty_expiry || '',
+            nextMaintenanceDate: a.next_maintenance_date || '',
+            sourceType:         a.source_type || 'Client',
+            sourceName:         a.supplier_name || a.source_name || '',
+            sourceCompany:      a.source_company || '',
+            sourcePhone:        a.source_phone || '',
+            sourceEmail:        a.source_email || '',
+            sourceWebsite:      a.source_website || '',
+            sourceAddress:      a.source_address || '',
+            sourceRemark:       a.source_remark || '',
+          }))
+          setInventory(mapped)
+          console.log('[Assets loaded]', mapped.length, 'items with DB UUIDs')
+        }
+      })
+      .catch(err => console.error('[Assets fetch failed]', err.message))
+    // ─────────────────────────────────────────────────────────────────────────
+
   }, [authToken])
   // ───────────────────────────────────────────────────────────────────────────
 
