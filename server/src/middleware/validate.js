@@ -38,6 +38,8 @@ const assetCreateSchema = z.object({
   category_id:                uuidField,
   location_id:                uuidField.optional().nullable(),
   supplier_id:                uuidField.optional().nullable(),
+  assigned_to:                uuidField.optional().nullable(),
+  assigned_since:             dateField,
   purchase_date:              dateField,
   purchase_price:             priceField,
   invoice_number:             z.string().max(100).optional().nullable(),

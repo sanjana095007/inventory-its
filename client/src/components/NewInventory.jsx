@@ -25,8 +25,56 @@ function storeToken(token) {
 function clearToken() {
   try { localStorage.removeItem('accessToken') } catch {}
 }
-async function apiFetch(path, options = {}) {
+function getRefreshToken() {
+  try { return localStorage.getItem('refreshToken') } catch { return null }
+}
+function storeRefreshToken(token) {
+  try { localStorage.setItem('refreshToken', token) } catch {}
+}
+function clearRefreshToken() {
+  try { localStorage.removeItem('refreshToken') } catch {}
+}
+
+// Prevent multiple simultaneous refresh calls
+let _refreshPromise = null
+
+async function refreshAccessToken() {
+  if (_refreshPromise) return _refreshPromise
+  _refreshPromise = (async () => {
+    const refreshToken = getRefreshToken()
+    if (!refreshToken) throw new Error('No refresh token')
+    const res = await fetch(`${API_BASE}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.message || 'Token refresh failed')
+    const newToken =
+      data.accessToken || data.access_token || data.token ||
+      data.data?.accessToken || data.data?.token
+    if (!newToken) throw new Error('No access token in refresh response')
+    storeToken(newToken)
+    const newRefresh =
+      data.refreshToken || data.refresh_token ||
+      data.data?.refreshToken || data.data?.refresh_token
+    if (newRefresh) storeRefreshToken(newRefresh)
+    return newToken
+  })()
+  try {
+    return await _refreshPromise
+  } finally {
+    _refreshPromise = null
+  }
+}
+
+async function apiFetch(path, options = {}, _retry = false) {
   const token = getToken()
+
+  if (!token && !_retry) {
+    throw new Error('Authentication required. Please sign in again.')
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
@@ -35,11 +83,37 @@ async function apiFetch(path, options = {}) {
       ...(options.headers || {}),
     },
   })
+
+  // Auto-refresh on 401 then retry once
+  if (res.status === 401 && !_retry) {
+    try {
+      console.log('[Auth] Access token expired — refreshing...')
+      await refreshAccessToken()
+      console.log('[Auth] Token refreshed — retrying request...')
+      return apiFetch(path, options, true)
+    } catch (refreshErr) {
+      console.error('[Auth] Token refresh failed:', refreshErr.message)
+      clearToken()
+      clearRefreshToken()
+      try { localStorage.removeItem('currentUser') } catch {}
+      window.dispatchEvent(new Event('auth-expired'))
+      throw new Error('Session expired. Please sign in again.')
+    }
+  }
+
   const json = await res.json().catch(() => ({}))
+
+  if (res.status === 401) {
+    clearToken()
+    clearRefreshToken()
+    try { localStorage.removeItem('currentUser') } catch {}
+    window.dispatchEvent(new Event('auth-expired'))
+    throw new Error(json.message || json.error || 'Session expired. Please sign in again.')
+  }
+
   if (!res.ok) {
     console.error(`[API ${res.status}] ${path}`, json)
     let msg = ''
-    // Handle 'issues' array (Zod/validation errors)
     if (Array.isArray(json.issues) && json.issues.length > 0) {
       msg = json.issues.map(e => {
         const field = Array.isArray(e.path) ? e.path.join('.') : (e.field || e.param || '')
@@ -240,7 +314,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
   const [showAllocate, setShowAllocate] = useState(null)
   const [showReturn, setShowReturn] = useState(null)
 
-  const emptyForm = { id: '', name: '', type: '', category: '3PL AA/CP', serial: '', asset: '', barcode: generateBarcode(), region: 'Bengaluru', engineer: '', receivedDate: '', returnDate: '', status: 'Available', remarks: '', quantity: 1, allocationDate: '', expectedReturn: '', sourceType: 'Client', sourceId: '', sourceName: '', sourceCompany: '', sourceAddress: '', sourcePhone: '', sourceEmail: '', sourceWebsite: '', sourceRemark: '', model: '', purchase_date: '', purchase_price: '', invoice_number: '', warranty_expiry: '', assigned_to: '', assigned_since: '', next_maintenance_date: '' }
+  const emptyForm = { id: '', name: '', type: '', category: '3PL AA/CP', serial: '', asset: '', barcode: generateBarcode(), region: 'Bengaluru', engineer: '', receivedDate: '', returnDate: '', status: 'Available', remarks: '', quantity: 1, allocationDate: '', expectedReturn: '', sourceType: 'Client', sourceId: '', sourceName: '', sourceCompany: '', sourceAddress: '', sourcePhone: '', sourceEmail: '', sourceWebsite: '', sourceRemark: '', model: '', purchase_date: '', purchase_price: '', invoice_number: '', warranty_expiry: '', assigned_to: '', assignedToId: '', assigned_since: '', next_maintenance_date: '' }
   const [form, setForm] = useState(emptyForm)
 
   const filtered = useMemo(() => inventory.filter(i =>
@@ -254,8 +328,31 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
-
   const [fieldErrors, setFieldErrors] = useState({})
+
+  // ── Fetch real users from /api/users for Assigned To dropdown ────────────
+  const [rawUsers, setRawUsers] = useState([])
+  const [usersLoading, setUsersLoading] = useState(false)
+  const [usersError, setUsersError] = useState(null)
+
+  useEffect(() => {
+    setUsersLoading(true)
+    apiFetch('/api/users')
+      .then(data => {
+        console.log('[Users API response]', data)
+        const list = Array.isArray(data) ? data : (data.users || data.data || data.results || data.items || [])
+        const active = list.filter(u => u.is_active !== false)
+        console.log('[Users loaded]', active.length, 'users')
+        setRawUsers(active)
+        setUsersError(null)
+      })
+      .catch(err => {
+        console.error('[Users fetch failed]', err.message)
+        setUsersError(err.message)
+      })
+      .finally(() => setUsersLoading(false))
+  }, [])
+  // ───────────────────────────────────────────────────────────────────────────
 
   const handleAdd = async () => {
     // ── Frontend validation ───────────────────────────────────────────────────
@@ -317,7 +414,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
         purchase_price:        form.purchase_price !== '' && form.purchase_price != null ? Number(form.purchase_price) : undefined,
         invoice_number:        form.invoice_number?.trim() || undefined,
         warranty_expiry:       form.warranty_expiry || undefined,
-        assigned_to:           form.assigned_to?.trim() || undefined,
+        assigned_to:           form.assignedToId || undefined,  // UUID from DB
         assigned_since:        form.assigned_since || undefined,
         next_maintenance_date: form.next_maintenance_date || undefined,
       }
@@ -382,7 +479,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
       }
       const mappedStatus = STATUS_MAP[form.status] || 'available'
 
-      const payload = {
+      const assetPayload = {
         name:                  form.type?.trim(),
         asset_tag:             form.asset?.trim() || undefined,
         serial_number:         form.serial?.trim(),
@@ -397,27 +494,28 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
         purchase_price:        form.purchase_price !== '' && form.purchase_price != null ? Number(form.purchase_price) : undefined,
         invoice_number:        form.invoice_number?.trim() || undefined,
         warranty_expiry:       form.warranty_expiry || undefined,
-        assigned_to:           form.assigned_to?.trim() || undefined,
+        assigned_to:           form.assignedToId || undefined,  // UUID from DB
         assigned_since:        form.assigned_since || undefined,
         next_maintenance_date: form.next_maintenance_date || undefined,
       }
+      const supplierPayload = {}
 
       if (form.sourceName?.trim()) {
-        payload.source_type    = form.sourceType || 'Client'
-        payload.source_name    = form.sourceName.trim()
-        payload.source_company = form.sourceCompany?.trim() || undefined
-        payload.source_phone   = form.sourcePhone?.trim() || undefined
-        payload.source_email   = form.sourceEmail?.trim() || undefined
-        payload.source_website = form.sourceWebsite?.trim() || undefined
-        payload.source_address = form.sourceAddress?.trim() || undefined
-        payload.source_remark  = form.sourceRemark?.trim() || undefined
+        supplierPayload.source_type    = form.sourceType || 'Client'
+        supplierPayload.source_name    = form.sourceName.trim()
+        supplierPayload.source_company = form.sourceCompany?.trim() || undefined
+        supplierPayload.source_phone   = form.sourcePhone?.trim() || undefined
+        supplierPayload.source_email   = form.sourceEmail?.trim() || undefined
+        supplierPayload.source_website = form.sourceWebsite?.trim() || undefined
+        supplierPayload.source_address = form.sourceAddress?.trim() || undefined
+        supplierPayload.source_remark  = form.sourceRemark?.trim() || undefined
       }
 
-      Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k])
+      Object.keys(assetPayload).forEach(k => assetPayload[k] === undefined && delete assetPayload[k])
 
       await apiFetch(`/api/assets/${showEdit.id}`, {
         method: 'PATCH',
-        body: JSON.stringify(payload),
+        body: JSON.stringify(assetPayload),
       })
 
       setInventory(inv => inv.map(i => i.id === showEdit.id ? { ...form } : i))
@@ -532,7 +630,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
                   <div style={{ display: 'flex', gap: 6 }}>
                     {(role === 'Administrator' || role === 'Inventory Manager') && (
                       <>
-                        <button title="Edit" onClick={() => { setForm({ ...item, assigned_to: item.assigned_to || item.engineer || '' }); setShowEdit(item) }} style={{ background: '#f3f4f6', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="edit" size={13} color="#374151" /></button>
+                        <button title="Edit" onClick={() => { setForm({ ...item, assignedToId: item.assigned_to || item.assignedToId || '', assigned_to: item.assigned_to || item.engineer || '' }); setShowEdit(item) }} style={{ background: '#f3f4f6', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="edit" size={13} color="#374151" /></button>
                         {item.status === 'Available' && <button title="Allocate" onClick={() => { setShowAllocate(item); setAllocForm({ engineer: '', project: '', allocationDate: new Date().toISOString().slice(0, 10), expectedReturn: '' }) }} style={{ background: '#dbeafe', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="allocate" size={13} color="#2563eb" /></button>}
                         {item.status === 'Allocated' && <button title="Return" onClick={() => { setShowReturn(item); setRetForm({ condition: 'Good' }) }} style={{ background: '#dcfce7', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="return" size={13} color="#16a34a" /></button>}
                         {role === 'Administrator' && <button title="Delete" onClick={() => handleDelete(item.id)} style={{ background: '#fee2e2', border: 'none', borderRadius: 6, padding: 6, cursor: 'pointer' }}><Icon name="trash" size={13} color="#dc2626" /></button>}
@@ -672,7 +770,26 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
               <Input label="Purchase Price" value={form.purchase_price} onChange={v => setF('purchase_price', v)} type="number" placeholder="e.g. 55000" />
               <Input label="Invoice Number" value={form.invoice_number} onChange={v => setF('invoice_number', v)} placeholder="e.g. INV-2026-001" />
               <Input label="Warranty Expiry" value={form.warranty_expiry} onChange={v => setF('warranty_expiry', v)} type="date" />
-              <Input label="Assigned To" value={form.assigned_to} onChange={v => setForm(f => ({ ...f, assigned_to: v, engineer: v }))} options={ALL_ENGINEERS} placeholder="Select engineer…" />
+              {/* Assigned To — real users from /api/users */}
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>Assigned To</label>
+                <select
+                  value={form.assignedToId || ''}
+                  onChange={e => {
+                    const u = rawUsers.find(u => u.id === e.target.value)
+                    setForm(f => ({ ...f, assignedToId: e.target.value, assigned_to: e.target.value, engineer: u ? u.name : '' }))
+                  }}
+                  disabled={usersLoading}
+                  style={{ width: '100%', padding: '9px 12px', border: '1.5px solid #d1d5db', borderRadius: 8, fontSize: 14, color: '#111827', background: '#fff', opacity: usersLoading ? 0.6 : 1 }}
+                >
+                  
+                  <option value="">{usersLoading ? 'Loading users…' : rawUsers.length === 0 ? 'No users available' : 'Select user…'}</option>
+                  {rawUsers.map(u => (
+                    <option key={u.id} value={u.id}>{u.name}{u.role ? ` — ${u.role}` : ''}</option>
+                  ))}
+                </select>
+                {usersError && <p style={{ margin: '4px 0 0', fontSize: 11, color: '#dc2626' }}>⚠ Could not load users: {usersError}</p>}
+              </div>
               <Input label="Assigned Since" value={form.assigned_since} onChange={v => setF('assigned_since', v)} type="date" />
               <Input label="Next Maintenance Date" value={form.next_maintenance_date} onChange={v => setF('next_maintenance_date', v)} type="date" />
             </div>
@@ -738,7 +855,7 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 16px' }}>
             <Input label="Item ID" value={form.id} onChange={v => setF('id', v)} />
             <Input label="Brand" value={form.name} onChange={v => setF('name', v)} required />
-            <Input label="Name" value={form.type} onChange={v => setF('type', v)} />
+            <Input label="" value={form.type} onChange={v => setF('type', v)} />
 
             {/* Category — stores label + UUID */}
             <div style={{ marginBottom: 16 }}>
@@ -787,7 +904,26 @@ function InventoryTable({ inventory, setInventory, auditLog, setAuditLog, role, 
               <Input label="Purchase Price" value={form.purchase_price} onChange={v => setF('purchase_price', v)} type="number" placeholder="e.g. 55000" />
               <Input label="Invoice Number" value={form.invoice_number} onChange={v => setF('invoice_number', v)} placeholder="e.g. INV-2026-001" />
               <Input label="Warranty Expiry" value={form.warranty_expiry} onChange={v => setF('warranty_expiry', v)} type="date" />
-              <Input label="Assigned To" value={form.assigned_to} onChange={v => setForm(f => ({ ...f, assigned_to: v, engineer: v }))} options={ALL_ENGINEERS} placeholder="Select engineer…" />
+              {/* Assigned To — real users from /api/users */}
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>Assigned To</label>
+                <select
+                  value={form.assignedToId || ''}
+                  onChange={e => {
+                    const u = rawUsers.find(u => u.id === e.target.value)
+                    setForm(f => ({ ...f, assignedToId: e.target.value, assigned_to: e.target.value, engineer: u ? u.name : '' }))
+                  }}
+                  disabled={usersLoading}
+                  style={{ width: '100%', padding: '9px 12px', border: '1.5px solid #d1d5db', borderRadius: 8, fontSize: 14, color: '#111827', background: '#fff', opacity: usersLoading ? 0.6 : 1 }}
+                >
+                  
+                  <option value="">{usersLoading ? 'Loading users…' : rawUsers.length === 0 ? 'No users available' : 'Select user…'}</option>
+                  {rawUsers.map(u => (
+                    <option key={u.id} value={u.id}>{u.name}{u.role ? ` — ${u.role}` : ''}</option>
+                  ))}
+                </select>
+                {usersError && <p style={{ margin: '4px 0 0', fontSize: 11, color: '#dc2626' }}>⚠ Could not load users: {usersError}</p>}
+              </div>
               <Input label="Assigned Since" value={form.assigned_since} onChange={v => setF('assigned_since', v)} type="date" />
               <Input label="Next Maintenance Date" value={form.next_maintenance_date} onChange={v => setF('next_maintenance_date', v)} type="date" />
             </div>
@@ -1455,8 +1591,30 @@ function SignIn({ onLogin }) {
       })
       const data = await response.json()
       if (response.ok && data.user) {
+        // Accept the token field used by the backend, while supporting common aliases.
+        const accessToken =
+          data.accessToken ||
+          data.access_token ||
+          data.token ||
+          data.data?.accessToken ||
+          data.data?.access_token ||
+          data.data?.token
+
+        if (!accessToken) {
+          setError('Login succeeded, but the server did not return an access token.')
+          setLoading(false)
+          return
+        }
+
         const normalizedUser = { ...data.user, role: normalizeRole(data.user.role) }
-        onLogin(normalizedUser, data.accessToken)
+
+        // Store refresh token if provided by backend
+        const refreshToken =
+          data.refreshToken || data.refresh_token ||
+          data.data?.refreshToken || data.data?.refresh_token
+        if (refreshToken) storeRefreshToken(refreshToken)
+
+        onLogin(normalizedUser, accessToken)
       } else {
         setError(data.message || 'Invalid email or password. Please try again.')
         setLoading(false)
@@ -1942,6 +2100,7 @@ function getStoredUser() {
 
 export default function InventoryApp() {
   const [currentUser, setCurrentUser] = useState(getStoredUser)
+  const [authToken, setAuthToken] = useState(() => getToken())
   const [page, setPage] = useState('dashboard')
   const [inventory, setInventory] = useState(INITIAL_INVENTORY)
   const [auditLog, setAuditLog] = useState(INITIAL_AUDIT)
@@ -1960,7 +2119,7 @@ export default function InventoryApp() {
   const [catError, setCatError] = useState(null)
 
   useEffect(() => {
-    if (!currentUser) return
+    if (!currentUser || !authToken) return
 
     setLocLoading(true)
     apiFetch('/api/locations')
@@ -1987,22 +2146,43 @@ export default function InventoryApp() {
       })
       .catch(() => setCatError('Could not load categories — using defaults.'))
       .finally(() => setCatLoading(false))
-  }, [currentUser])
+  }, [authToken])
   // ───────────────────────────────────────────────────────────────────────────
 
   const handleLogout = () => {
     setCurrentUser(null)
+    setAuthToken(null)
     setPage('dashboard')
     localStorage.removeItem('currentUser')
     clearToken()
+    clearRefreshToken()
   }
+
+  // If a protected API returns 401, invalidate the local session.
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      setCurrentUser(null)
+      setAuthToken(null)
+      setPage('dashboard')
+      localStorage.removeItem('currentUser')
+      clearToken()
+      clearRefreshToken()
+    }
+
+    window.addEventListener('auth-expired', handleAuthExpired)
+    return () => window.removeEventListener('auth-expired', handleAuthExpired)
+  }, [])
 
   if (!currentUser) {
     return <SignIn onLogin={(user, token) => {
+      // Store the fresh token BEFORE setting currentUser.
+      if (!token) return
+
+      storeToken(token)
+      setAuthToken(token)
+      localStorage.setItem('currentUser', JSON.stringify(user))
       setCurrentUser(user)
       setPage('dashboard')
-      localStorage.setItem('currentUser', JSON.stringify(user))
-      if (token) storeToken(token)
     }} />
   }
 
